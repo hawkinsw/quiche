@@ -695,7 +695,7 @@ impl QlogStreamer {
         {
             Ok(mut ev_data_out) =>
                 if let Some(f) = event.data.contains_quic_frames() {
-                    ev_data_out.truncate(ev_data_out.len() - 2);
+                    ev_data_out.truncate(ev_data_out.len() - 1);
 
                     if f == 0 {
                         self.first_frame = true;
