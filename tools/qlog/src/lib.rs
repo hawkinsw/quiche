@@ -695,7 +695,7 @@ impl QlogStreamer {
         {
             Ok(mut ev_data_out) =>
                 if let Some(f) = event.data.contains_quic_frames() {
-                    ev_data_out.truncate(ev_data_out.len() - 1);
+                    ev_data_out.truncate(ev_data_out.len() - 2);
 
                     if f == 0 {
                         self.first_frame = true;
@@ -1314,23 +1314,23 @@ pub enum EventData {
     PacketReceived {
         packet_type: PacketType,
         header: PacketHeader,
-        frames: Option<Vec<QuicFrame>>,
 
         is_coalesced: Option<bool>,
 
         raw_encrypted: Option<String>,
         raw_decrypted: Option<String>,
+        frames: Option<Vec<QuicFrame>>,
     },
 
     PacketSent {
         packet_type: PacketType,
         header: PacketHeader,
-        frames: Option<Vec<QuicFrame>>,
 
         is_coalesced: Option<bool>,
 
         raw_encrypted: Option<String>,
         raw_decrypted: Option<String>,
+        frames: Option<Vec<QuicFrame>>,
     },
 
     PacketDropped {
