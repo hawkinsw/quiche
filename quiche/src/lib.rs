@@ -7984,6 +7984,29 @@ impl std::fmt::Debug for Stats {
     }
 }
 
+/// QUIC Unknown Transport Parameters
+///
+/// QUIC transport parameters that are not specifically recognized
+/// by this implementation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnknownTransportParameter {
+    /// ID of an unknown transport parameter
+    pub id: u64,
+    /// Original data representing the value of an unknown transport parameter
+    pub value: Vec<u8>,
+}
+
+impl From<UnknownTransportParameter>
+    for qlog::events::quic::UnknownTransportParameter
+{
+    fn from(value: UnknownTransportParameter) -> Self {
+        Self {
+            id: value.id,
+            value: value.value,
+        }
+    }
+}
+
 /// QUIC Transport Parameters
 #[derive(Clone, Debug, PartialEq)]
 pub struct TransportParams {
@@ -8023,6 +8046,8 @@ pub struct TransportParams {
     pub retry_source_connection_id: Option<ConnectionId<'static>>,
     /// DATAGRAM frame extension parameter, if any.
     pub max_datagram_frame_size: Option<u64>,
+    /// Unknown peer transport parameters and values, if any.
+    pub unknown_params: Vec<UnknownTransportParameter>,
     // pub preferred_address: ...,
 }
 
@@ -8046,6 +8071,7 @@ impl Default for TransportParams {
             initial_source_connection_id: None,
             retry_source_connection_id: None,
             max_datagram_frame_size: None,
+            unknown_params: vec![],
         }
     }
 }
@@ -8196,8 +8222,13 @@ impl TransportParams {
                     tp.max_datagram_frame_size = Some(val.get_varint()?);
                 },
 
-                // Ignore unknown parameters.
-                _ => (),
+                // Track unknown transport parameters specially.
+                unknown_tp_id => {
+                    tp.unknown_params.push(UnknownTransportParameter {
+                        id: unknown_tp_id,
+                        value: val.to_vec(),
+                    });
+                },
             }
         }
 
@@ -8410,6 +8441,12 @@ impl TransportParams {
                 initial_max_streams_uni: Some(self.initial_max_streams_uni),
 
                 preferred_address: None,
+
+                unknown_parameters: self.unknown_params
+                    .iter()
+                    .cloned()
+                    .map(Into::<qlog::events::quic::UnknownTransportParameter>::into)
+                    .collect(),
             },
         )
     }
@@ -8952,6 +8989,7 @@ mod tests {
             initial_source_connection_id: Some(b"woot woot".to_vec().into()),
             retry_source_connection_id: Some(b"retry".to_vec().into()),
             max_datagram_frame_size: Some(32),
+            unknown_params: vec![],
         };
 
         let mut raw_params = [42; 256];
@@ -8982,6 +9020,7 @@ mod tests {
             initial_source_connection_id: Some(b"woot woot".to_vec().into()),
             retry_source_connection_id: None,
             max_datagram_frame_size: Some(32),
+            unknown_params: vec![],
         };
 
         let mut raw_params = [42; 256];
