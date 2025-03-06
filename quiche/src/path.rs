@@ -112,11 +112,24 @@ pub enum PathEvent {
     PeerMigrated(SocketAddr, SocketAddr),
 }
 
+#[derive(Debug, PartialEq, PartialOrd)]
+pub enum PathObservedAddressStatus {
+    /// There is no need to send an address discovery frame on this path.
+    NotNeeded,
+    /// There is a need to send an address discovery frame on this path.
+    Needed,
+    /// An address discovery frame has been sent on this path.
+    Sent,
+}
+
 /// A network path on which QUIC packets can be sent.
 #[derive(Debug)]
 pub struct Path {
     /// The local address.
     local_addr: SocketAddr,
+
+    // The observed address, if one has been reported.
+    observed_addr: Option<SocketAddr>,
 
     /// The remote address.
     peer_addr: SocketAddr,
@@ -205,6 +218,13 @@ pub struct Path {
 
     /// Whether or not we should force eliciting of an ACK (e.g. via PING frame)
     pub needs_ack_eliciting: bool,
+
+    /// Whether have or (do not) need to send an address discovery message on this path.
+    pub path_observed_address: PathObservedAddressStatus,
+
+    /// Whether we have received any observed address frames and, if so, what is
+    /// the greatest sequence number contained therein.
+    pub max_observed_address_seq_no_recvd: Option<u64>,
 }
 
 impl Path {
@@ -224,6 +244,7 @@ impl Path {
 
         Self {
             local_addr,
+            observed_addr: None,
             peer_addr,
             active_scid_seq,
             active_dcid_seq,
@@ -254,6 +275,8 @@ impl Path {
             failure_notified: false,
             migrating: false,
             needs_ack_eliciting: false,
+            path_observed_address: PathObservedAddressStatus::NotNeeded,
+            max_observed_address_seq_no_recvd: None,
         }
     }
 
@@ -267,6 +290,15 @@ impl Path {
     #[inline]
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
+    }
+
+    pub fn set_observed_addr(&mut self, observed_addr: SocketAddr) {
+        self.observed_addr = Some(observed_addr);
+    }
+
+    /// TODO
+    pub fn observed_addr(&self) -> Option<SocketAddr> {
+        self.observed_addr
     }
 
     /// Returns whether the path is working (i.e., not failed).

@@ -373,6 +373,7 @@ pub enum QuicFrameTypeName {
     ApplicationClose,
     HandshakeDone,
     Datagram,
+    ObservedAddress,
     #[default]
     Unknown,
 }
@@ -508,11 +509,25 @@ pub enum QuicFrame {
         raw: Option<Bytes>,
     },
 
+    ObservedAddress {
+        seq_num: u64,
+        ip_v4: String,
+        ip_v6: String,
+        port: u16,
+    },
+
     Unknown {
         raw_frame_type: u64,
         frame_type_value: Option<u64>,
         raw: Option<RawInfo>,
     },
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub enum AddressDiscovery {
+    Provider,
+    Receiver,
+    Both
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -573,6 +588,8 @@ pub struct TransportParametersSet {
     pub initial_max_streams_uni: Option<u64>,
 
     pub preferred_address: Option<PreferredAddress>,
+
+    pub address_discovery: Option<AddressDiscovery>,
 
     pub unknown_parameters: Vec<UnknownTransportParameter>,
 }

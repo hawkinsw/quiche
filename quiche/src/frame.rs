@@ -25,6 +25,8 @@
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::convert::TryInto;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 
 use crate::Error;
 use crate::Result;
@@ -52,6 +54,21 @@ pub struct EcnCounts {
     ect0_count: u64,
     ect1_count: u64,
     ecn_ce_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObservedIpAddress {
+    Ipv4(Ipv4Addr),
+    Ipv6(Ipv6Addr),
+}
+
+impl ObservedIpAddress {
+    fn wire_len(&self) -> usize {
+        match self {
+            ObservedIpAddress::Ipv4(_) => 4,
+            ObservedIpAddress::Ipv6(_) => 16,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -183,6 +200,12 @@ pub enum Frame {
 
     DatagramHeader {
         length: usize,
+    },
+
+    ObservedAddress {
+        seq_num: u64,
+        observed_address: ObservedIpAddress,
+        port: u16,
     },
 }
 
@@ -331,12 +354,18 @@ impl Frame {
 
             0x30 | 0x31 => parse_datagram_frame(frame_type, b)?,
 
+            0x9f81a6 | 0x9f81a7 => {
+                parse_observed_address_frame(frame_type % 2 == 0, b)?
+            },
+
             _ => return Err(Error::InvalidFrame),
         };
 
         let allowed = match (pkt, &frame) {
             // PADDING and PING are allowed on all packet types.
-            (_, Frame::Padding { .. }) | (_, Frame::Ping { .. }) => true,
+            (_, Frame::Padding { .. })
+            | (_, Frame::Ping { .. })
+            | (_, Frame::ObservedAddress { .. }) => true,
 
             // ACK, CRYPTO, HANDSHAKE_DONE, NEW_TOKEN, PATH_RESPONSE, and
             // RETIRE_CONNECTION_ID can't be sent on 0-RTT packets.
@@ -593,6 +622,24 @@ impl Frame {
             },
 
             Frame::DatagramHeader { .. } => (),
+
+            Frame::ObservedAddress {
+                seq_num,
+                observed_address,
+                port,
+            } => {
+                // Frame type depends on the address being "observed".
+                match observed_address {
+                    ObservedIpAddress::Ipv4(_) => b.put_varint(0x9f81a6),
+                    ObservedIpAddress::Ipv6(_) => b.put_varint(0x9f81a7),
+                }?;
+                b.put_varint(*seq_num)?;
+                match observed_address {
+                    ObservedIpAddress::Ipv4(v4) => b.put_bytes(&v4.octets()),
+                    ObservedIpAddress::Ipv6(v6) => b.put_bytes(&v6.octets()),
+                }?;
+                b.put_u16(*port)?;
+            },
         }
 
         Ok(before - b.cap())
@@ -808,6 +855,17 @@ impl Frame {
                 2 + // length, always encode as 2-byte varint
                 *length // data
             },
+
+            Frame::ObservedAddress {
+                seq_num,
+                observed_address,
+                port: _,
+            } => {
+                octets::varint_len(0x9f81a176) + // frame type
+                octets::varint_len(*seq_num) + // seq_num
+                observed_address.wire_len() + // address
+                2 // port
+            },
         }
     }
 
@@ -815,20 +873,22 @@ impl Frame {
         // Any other frame is ack-eliciting (note the `!`).
         !matches!(
             self,
-            Frame::Padding { .. } |
-                Frame::ACK { .. } |
-                Frame::ApplicationClose { .. } |
-                Frame::ConnectionClose { .. }
+            Frame::Padding { .. }
+                | Frame::ACK { .. }
+                | Frame::ApplicationClose { .. }
+                | Frame::ConnectionClose { .. }
+                | Frame::ObservedAddress { .. }
         )
     }
 
     pub fn probing(&self) -> bool {
         matches!(
             self,
-            Frame::Padding { .. } |
-                Frame::NewConnectionId { .. } |
-                Frame::PathChallenge { .. } |
-                Frame::PathResponse { .. }
+            Frame::Padding { .. }
+                | Frame::NewConnectionId { .. }
+                | Frame::PathChallenge { .. }
+                | Frame::PathResponse { .. }
+                | Frame::ObservedAddress { .. }
         )
     }
 
@@ -1033,6 +1093,25 @@ impl Frame {
                 length: *length as u64,
                 raw: None,
             },
+
+            Frame::ObservedAddress {
+                seq_num,
+                observed_address,
+                port,
+            } => QuicFrame::ObservedAddress {
+                seq_num: *seq_num,
+                ip_v4: if let ObservedIpAddress::Ipv4(v4) = observed_address {
+                    format!("{:}", v4)
+                } else {
+                    "".to_string()
+                },
+                ip_v6: if let ObservedIpAddress::Ipv6(v6) = observed_address {
+                    format!("{:}", v6)
+                } else {
+                    "".to_string()
+                },
+                port: *port,
+            },
         }
     }
 }
@@ -1200,10 +1279,40 @@ impl std::fmt::Debug for Frame {
             Frame::DatagramHeader { length } => {
                 write!(f, "DATAGRAM len={length}")?;
             },
+
+            Frame::ObservedAddress {
+                seq_num,
+                observed_address,
+                port,
+            } => {
+                write!(f, "OBSERVED ADDRESS sequence number={} observed_address={:?} port = {}", seq_num, observed_address, port)?;
+            },
         }
 
         Ok(())
     }
+}
+
+fn parse_observed_address_frame(
+    is_ipv4: bool, b: &mut octets::Octets,
+) -> Result<Frame> {
+    let seq_num = b.get_varint().map_err(|_| Error::InvalidFrame)?;
+    let observed_address = if is_ipv4 {
+        let bytes = b.get_bytes(4).map_err(|_| Error::InvalidFrame)?;
+        let mut ip_bytes = [0u8; 4];
+        ip_bytes.copy_from_slice(bytes.buf());
+        let ip = Into::<Ipv4Addr>::into(ip_bytes);
+        ObservedIpAddress::Ipv4(ip)
+    } else {
+        let bytes = b.get_bytes(16).map_err(|_| Error::InvalidFrame)?;
+        let mut ip_bytes = [0u8; 16];
+        ip_bytes.copy_from_slice(bytes.buf());
+        let ip = Into::<Ipv6Addr>::into(ip_bytes);
+        ObservedIpAddress::Ipv6(ip)
+    };
+
+    let port = b.get_u16().map_err(|_| Error::InvalidFrame)?;
+    Ok(Frame::ObservedAddress { seq_num, observed_address, port })
 }
 
 fn parse_ack_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {

@@ -382,11 +382,16 @@
 #[macro_use]
 extern crate log;
 
+use frame::Frame;
+use frame::ObservedIpAddress;
 use octets::BufferTooShortError;
+use path::PathObservedAddressStatus;
 #[cfg(feature = "qlog")]
 use qlog::events::connectivity::ConnectivityEventType;
 #[cfg(feature = "qlog")]
 use qlog::events::connectivity::TransportOwner;
+#[cfg(feature = "qlog")]
+use qlog::events::quic::AddressDiscovery;
 #[cfg(feature = "qlog")]
 use qlog::events::quic::RecoveryEventType;
 #[cfg(feature = "qlog")]
@@ -407,6 +412,8 @@ use stream::StreamPriorityKey;
 
 use std::cmp;
 use std::convert::TryInto;
+use std::net::SocketAddrV4;
+use std::net::SocketAddrV6;
 use std::time;
 
 use std::sync::Arc;
@@ -576,6 +583,9 @@ pub enum Error {
 
     /// The peer sent more data in CRYPTO frames than we can buffer.
     CryptoBufferExceeded,
+
+    /// TODO
+    UnrequestedObservedAddress,
 }
 
 /// QUIC error codes sent on the wire.
@@ -1356,6 +1366,19 @@ impl Config {
         self.disable_dcid_reuse = v;
     }
 
+    /// Sets whether this node will support address discovery.
+    ///
+    /// Specify whether this node will provide, receive (or both) address observations
+    /// to/from its peer. Pass None to disable all support for address observability
+    /// on this connection.
+    ///
+    /// The default value is `None`
+    pub fn set_address_discovery(
+        &mut self, option: Option<AddressDiscoveryOption>,
+    ) {
+        self.local_transport_params.address_discovery = option;
+    }
+
     /// Enables tracking unknown transport parameters.
     ///
     /// Specify the maximum number of bytes used to track unknown transport
@@ -1596,6 +1619,10 @@ pub struct Connection {
 
     /// The anti-amplification limit factor.
     max_amplification_factor: usize,
+
+    /// A monotonically increasing sequence number for observed address frames
+    /// transmitted on this connection.
+    observed_address_sequence_no: u64,
 }
 
 /// Creates a new server-side connection.
@@ -2044,6 +2071,8 @@ impl Connection {
             stopped_stream_remote_count: 0,
 
             max_amplification_factor: config.max_amplification_factor,
+
+            observed_address_sequence_no: 0,
         };
 
         if let Some(odcid) = odcid {
@@ -3643,12 +3672,19 @@ impl Connection {
                         p.pmtud.pmtu_probe_lost();
                     },
 
+                    frame::Frame::ObservedAddress { .. } => {
+                        // If there was an observed address packet lost, mark that another
+                        // one will need to be sent.
+                        p.path_observed_address = PathObservedAddressStatus::Needed;
+                    },
+
                     _ => (),
                 }
             }
         }
 
         let is_app_limited = self.delivery_rate_check_if_app_limited();
+        let needs_observed_address = self.provide_observed_address();
         let n_paths = self.paths.len();
         let path = self.paths.get_mut(send_pid)?;
         let flow_control = &mut self.flow_control;
@@ -3911,7 +3947,10 @@ impl Connection {
 
                 pmtud_probe = true;
             }
+        }
 
+        // Create path validation packets, if necessary.
+        if pkt_type == packet::Type::Short {
             let path = self.paths.get_mut(send_pid)?;
             // Create PATH_RESPONSE frame if needed.
             // We do not try to ensure that these are really sent.
@@ -3925,6 +3964,16 @@ impl Connection {
                     // If there are other pending PATH_RESPONSE, don't lose them
                     // now.
                     break;
+                }
+
+                // If we received a challenge, we should send the observed address in the response,
+                // if one was requested. We only send on a response (again, where appropriate) because
+                // the peer endpoint's reception of this frame will complete path validation.
+                if path.path_observed_address != PathObservedAddressStatus::Sent
+                    && needs_observed_address
+                {
+                    path.path_observed_address =
+                        PathObservedAddressStatus::Needed;
                 }
             }
 
@@ -3950,6 +3999,31 @@ impl Connection {
         }
 
         let path = self.paths.get_mut(send_pid)?;
+
+        if pkt_type == packet::Type::Short
+            && !is_closing
+            && path.path_observed_address == PathObservedAddressStatus::Needed
+        {
+            let frame = match path.peer_addr() {
+                SocketAddr::V4(v4) => Frame::ObservedAddress {
+                    seq_num: self.observed_address_sequence_no,
+                    observed_address: ObservedIpAddress::Ipv4(*v4.ip()),
+                    port: v4.port(),
+                },
+                SocketAddr::V6(v6) => Frame::ObservedAddress {
+                    seq_num: self.observed_address_sequence_no,
+                    observed_address: ObservedIpAddress::Ipv6(*v6.ip()),
+                    port: v6.port(),
+                },
+            };
+
+            if push_frame_to_pkt!(b, frames, frame, left) {
+                path.path_observed_address = PathObservedAddressStatus::Sent;
+                ack_eliciting = true;
+                in_flight = true;
+                self.observed_address_sequence_no += 1;
+            }
+        }
 
         if pkt_type == packet::Type::Short && !is_closing {
             // Create NEW_CONNECTION_ID frames as needed.
@@ -4375,11 +4449,11 @@ impl Connection {
         }
 
         // Create a single STREAM frame for the first stream that is flushable.
-        if (pkt_type == packet::Type::Short || pkt_type == packet::Type::ZeroRTT) &&
-            left > frame::MAX_STREAM_OVERHEAD &&
-            !is_closing &&
-            path.active() &&
-            !dgram_emitted
+        if (pkt_type == packet::Type::Short || pkt_type == packet::Type::ZeroRTT)
+            && left > frame::MAX_STREAM_OVERHEAD
+            && !is_closing
+            && path.active()
+            && !dgram_emitted
         {
             while let Some(priority_key) = self.streams.peek_flushable() {
                 let stream_id = priority_key.id;
@@ -6846,6 +6920,14 @@ impl Connection {
                 self.drop_epoch_state(packet::Epoch::Handshake, now);
             }
 
+            // Now that the handshake is complete, we will be able to
+            // send packets in the application space. Now is as good a time
+            // as any to determine whether the an observed address frame
+            // needs to be sent on the active path.
+            if self.provide_observed_address() {
+                self.paths.get_active_mut()?.path_observed_address = PathObservedAddressStatus::Needed;
+            }
+
             // Once the handshake is completed there's no point in processing
             // 0-RTT packets anymore, so clear the buffer now.
             self.undecryptable_pkts.clear();
@@ -7465,6 +7547,36 @@ impl Connection {
             },
 
             frame::Frame::DatagramHeader { .. } => unreachable!(),
+
+            frame::Frame::ObservedAddress {
+                seq_num,
+                observed_address,
+                port,
+            } => {
+                if !self.receive_observed_address() {
+                    // Receiving an observed address frame without having asked is an error.
+                    return Err(Error::UnrequestedObservedAddress);
+                }
+
+                let path = self.paths.get_mut(recv_path_id)?;
+
+                let observed_socket_addr = match observed_address {
+                    frame::ObservedIpAddress::Ipv4(v4) => {
+                        SocketAddr::V4(SocketAddrV4::new(v4, port))
+                    },
+                    frame::ObservedIpAddress::Ipv6(v6) => {
+                        SocketAddr::V6(SocketAddrV6::new(v6, port, 0, 0))
+                    },
+                };
+
+                if path.max_observed_address_seq_no_recvd.map_or(true, |v| v < seq_num) {
+                    // This observed address frame is not a duplicate. Update.
+                    path.set_observed_addr(observed_socket_addr);
+                    path.max_observed_address_seq_no_recvd = Some(seq_num);
+                } else {
+                    trace!("Got an observed_address frame with a non-monotonically increasing sequence number received.")
+                }
+            },
         }
 
         Ok(())
@@ -7929,6 +8041,50 @@ impl Connection {
         }
         self.closed = true;
     }
+
+    /// TODO
+    fn provide_observed_address(&self) -> bool {
+        self.peer_transport_params
+            .address_discovery
+            .as_ref()
+            .map_or(false, |v| {
+                let result = *v == AddressDiscoveryOption::Receiver
+                    || *v == AddressDiscoveryOption::Both;
+                println!("Peer result: {}", result);
+                result
+            })
+            && self
+                .local_transport_params
+                .address_discovery
+                .as_ref()
+                .map_or(false, |v| {
+                    let result = *v == AddressDiscoveryOption::Provider
+                        || *v == AddressDiscoveryOption::Both;
+                    println!("local result: {}", result);
+                    result
+                })
+    }
+    fn receive_observed_address(&self) -> bool {
+        self.peer_transport_params
+            .address_discovery
+            .as_ref()
+            .map_or(false, |v| {
+                let result = *v == AddressDiscoveryOption::Provider
+                    || *v == AddressDiscoveryOption::Both;
+                println!("Peer result: {}", result);
+                result
+            })
+            && self
+                .local_transport_params
+                .address_discovery
+                .as_ref()
+                .map_or(false, |v| {
+                    let result = *v == AddressDiscoveryOption::Receiver
+                        || *v == AddressDiscoveryOption::Both;
+                    println!("local result: {}", result);
+                    result
+                })
+    }
 }
 
 #[cfg(feature = "boringssl-boring-crate")]
@@ -8169,6 +8325,56 @@ impl<'a> Iterator for UnknownTransportParameterIterator<'a> {
     }
 }
 
+/// The possible configuration for an endpoint with respect to
+/// providing or receiving address observability.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AddressDiscoveryOption {
+    /// This endpoint provides address discoverability.
+    Provider,
+    /// This endpoint receives address discoverability.
+    Receiver,
+    /// This endpoint both sends and receives address discoverability.
+    Both,
+}
+
+impl From<&AddressDiscoveryOption> for u64 {
+    fn from(value: &AddressDiscoveryOption) -> Self {
+        match value {
+            AddressDiscoveryOption::Provider => 0,
+            AddressDiscoveryOption::Receiver => 1,
+            AddressDiscoveryOption::Both => 2,
+        }
+    }
+}
+
+impl TryFrom<&mut octets::Octets<'_>> for AddressDiscoveryOption {
+    type Error = Error;
+    fn try_from(value: &mut octets::Octets) -> Result<AddressDiscoveryOption> {
+        match value.get_varint()? {
+            0 => Ok(AddressDiscoveryOption::Provider),
+            1 => Ok(AddressDiscoveryOption::Receiver),
+            2 => Ok(AddressDiscoveryOption::Both),
+            _ => Err(Error::InvalidTransportParam),
+        }
+    }
+}
+
+impl From<&AddressDiscoveryOption> for qlog::events::quic::AddressDiscovery {
+    fn from(value: &AddressDiscoveryOption) -> Self {
+        match value {
+            AddressDiscoveryOption::Provider => {
+                qlog::events::quic::AddressDiscovery::Provider
+            },
+            AddressDiscoveryOption::Receiver => {
+                qlog::events::quic::AddressDiscovery::Receiver
+            },
+            AddressDiscoveryOption::Both => {
+                qlog::events::quic::AddressDiscovery::Both
+            },
+        }
+    }
+}
+
 /// QUIC Transport Parameters
 #[derive(Clone, Debug, PartialEq)]
 pub struct TransportParams {
@@ -8208,6 +8414,8 @@ pub struct TransportParams {
     pub retry_source_connection_id: Option<ConnectionId<'static>>,
     /// DATAGRAM frame extension parameter, if any.
     pub max_datagram_frame_size: Option<u64>,
+    /// Mode for address discovery extension, if any.
+    pub address_discovery: Option<AddressDiscoveryOption>,
     /// Unknown peer transport parameters and values, if any.
     pub unknown_params: Option<UnknownTransportParameters>,
     // pub preferred_address: ...,
@@ -8233,6 +8441,7 @@ impl Default for TransportParams {
             initial_source_connection_id: None,
             retry_source_connection_id: None,
             max_datagram_frame_size: None,
+            address_discovery: None,
             unknown_params: Default::default(),
         }
     }
@@ -8391,6 +8600,13 @@ impl TransportParams {
 
                 0x0020 => {
                     tp.max_datagram_frame_size = Some(val.get_varint()?);
+                },
+
+                0x9f81a176 => {
+                    println!("Got an address discovery?");
+                    tp.address_discovery = Some(
+                        TryInto::<AddressDiscoveryOption>::try_into(&mut val)?,
+                    );
                 },
 
                 // Track unknown transport parameters specially.
@@ -8564,6 +8780,16 @@ impl TransportParams {
             b.put_varint(max_datagram_frame_size)?;
         }
 
+        if let Some(address_discovery) = &tp.address_discovery {
+            let ad_value = Into::<u64>::into(address_discovery);
+            TransportParams::encode_param(
+                &mut b,
+                0x9f81a176,
+                octets::varint_len(ad_value),
+            )?;
+            b.put_varint(ad_value)?;
+        }
+
         let out_len = b.off();
 
         Ok(&mut out[..out_len])
@@ -8611,6 +8837,11 @@ impl TransportParams {
                 ),
                 initial_max_streams_bidi: Some(self.initial_max_streams_bidi),
                 initial_max_streams_uni: Some(self.initial_max_streams_uni),
+
+                address_discovery: self
+                    .address_discovery
+                    .as_ref()
+                    .map(Into::<AddressDiscovery>::into),
 
                 unknown_parameters: self
                     .unknown_params
@@ -9171,6 +9402,7 @@ mod tests {
             initial_source_connection_id: Some(b"woot woot".to_vec().into()),
             retry_source_connection_id: Some(b"retry".to_vec().into()),
             max_datagram_frame_size: Some(32),
+            address_discovery: None,
             unknown_params: Default::default(),
         };
 
@@ -9202,6 +9434,7 @@ mod tests {
             initial_source_connection_id: Some(b"woot woot".to_vec().into()),
             retry_source_connection_id: None,
             max_datagram_frame_size: Some(32),
+            address_discovery: None,
             unknown_params: Default::default(),
         };
 
